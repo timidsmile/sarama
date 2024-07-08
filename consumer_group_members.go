@@ -126,7 +126,8 @@ func (m *OwnedPartition) decode(pd packetDecoder) (err error) {
 // ConsumerGroupMemberAssignment holds the member assignment for a consume group
 // https://github.com/apache/kafka/blob/trunk/clients/src/main/resources/common/message/ConsumerProtocolAssignment.json
 type ConsumerGroupMemberAssignment struct {
-	Version  int16
+	Version int16
+	// key: topic ; value: 分配到的partition数组
 	Topics   map[string][]int32
 	UserData []byte
 }

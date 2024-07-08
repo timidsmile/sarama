@@ -32,6 +32,11 @@ type GroupMember struct {
 	Metadata []byte
 }
 
+/*
+key: memberID
+Value: 该成员订阅的topic灯信息
+todo 这个 OwnedPartitions 如何理解？joinGroup后返回的应该是leaderID、memberID、members 信息，此时应该不涉及到 partition的分配
+*/
 func (r *JoinGroupResponse) GetMembers() (map[string]ConsumerGroupMemberMetadata, error) {
 	members := make(map[string]ConsumerGroupMemberMetadata, len(r.Members))
 	for _, member := range r.Members {

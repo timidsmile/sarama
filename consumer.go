@@ -156,7 +156,9 @@ func (c *consumer) Partitions(topic string) ([]int32, error) {
 	return c.client.Partitions(topic)
 }
 
+// newConsumerGroup 的时候生成的 consumer 并赋值给了 consumerGroup
 func (c *consumer) ConsumePartition(topic string, partition int32, offset int64) (PartitionConsumer, error) {
+	// child 是针对每个topic下的每个 partition 的。有多少个 topic 下的 partition 就有多少个 child
 	child := &partitionConsumer{
 		consumer:             c,
 		conf:                 c.conf,
@@ -172,24 +174,32 @@ func (c *consumer) ConsumePartition(topic string, partition int32, offset int64)
 		fetchSize:            c.conf.Consumer.Fetch.Default,
 	}
 
+	// 将常量 offset 换算成真实的offset，并赋值给 child.offset
 	if err := child.chooseStartingOffset(offset); err != nil {
 		return nil, err
 	}
 
+	// 获取该 partition 所在的broker（leader），并获取 epoch
 	leader, epoch, err := c.client.LeaderAndEpoch(child.topic, child.partition)
 	if err != nil {
 		return nil, err
 	}
 
+	// child 赋值给 consumer
 	if err := c.addChild(child); err != nil {
 		return nil, err
 	}
 
+	// 每个partition的消费协程里都会开两个协程
+	// 1.  dispatch :
+	// 2. responseFeeder:
 	go withRecover(child.dispatcher)
 	go withRecover(child.responseFeeder)
 
 	child.leaderEpoch = epoch
+	// 这个child 负责的 partition 所在的broker
 	child.broker = c.refBrokerConsumer(leader)
+	// 这里反过来把 child 放到了 brokerConsumer里，后续通过 input 这个channel，brokerConsumer 实现与 child的通信
 	child.broker.input <- child
 
 	return child, nil
@@ -236,6 +246,14 @@ func (c *consumer) removeChild(child *partitionConsumer) {
 	delete(c.children[child.topic], child.partition)
 }
 
+/*
+这个是用 broker 进行归类了
+因为一个 broker 上会有多个 partition ，这个信息放到 partition维度（children）肯定会重复
+因此 consumer 直接用  brokerConsumers 维护了 broker 信息
+除了给brokerConsumers赋值，还负责初始化 brokerConsumers ，每个broker 会开两个协程：
+1. subscriptionManager：
+2. subscriptionConsumer
+*/
 func (c *consumer) refBrokerConsumer(broker *Broker) *brokerConsumer {
 	c.lock.Lock()
 	defer c.lock.Unlock()
@@ -440,6 +458,10 @@ func (child *partitionConsumer) computeBackoff() time.Duration {
 	return child.conf.Consumer.Retry.Backoff
 }
 
+/*
+partition 维度的consumer，有多少个parition就有多少个协程来处理这个 dispatch
+todo
+*/
 func (child *partitionConsumer) dispatcher() {
 	for range child.trigger {
 		select {
@@ -451,6 +473,7 @@ func (child *partitionConsumer) dispatcher() {
 				child.broker = nil
 			}
 
+			// todo
 			if err := child.dispatch(); err != nil {
 				child.sendError(err)
 				child.trigger <- none{}
@@ -502,7 +525,9 @@ func (child *partitionConsumer) dispatch() error {
 	return nil
 }
 
+// 该函数将offset为 OffsetNewest 和 OffsetOldest 两种常量类型转为真实的offset值
 func (child *partitionConsumer) chooseStartingOffset(offset int64) error {
+	// 这里又获取了一次，有点浪费性能。实际上只有当该函数明确指定了offset为OffsetNewest 才需要获取
 	newestOffset, err := child.consumer.client.GetOffset(child.topic, child.partition, OffsetNewest)
 	if err != nil {
 		return err
@@ -510,6 +535,7 @@ func (child *partitionConsumer) chooseStartingOffset(offset int64) error {
 
 	child.highWaterMarkOffset = newestOffset
 
+	// 同上，只有当 offset 明确指定了 oldestOffset 的时候才需要获取
 	oldestOffset, err := child.consumer.client.GetOffset(child.topic, child.partition, OffsetOldest)
 	if err != nil {
 		return err
@@ -571,18 +597,26 @@ func (child *partitionConsumer) responseFeeder() {
 	firstAttempt := true
 
 feederLoop:
+	// 不停地从channel中读数据
 	for response := range child.feeder {
+		// 解析返回的数据到 ConsumerMessage ，这个也是最终暴露给用户的消息体结构
 		msgs, child.responseResult = child.parseResponse(response)
 
+		// 如果没有拉取到消息
 		if child.responseResult == nil {
+			// todo ???
 			atomic.StoreInt32(&child.retries, 0)
 		}
 
+		// 批量拉取的消息
 		for i, msg := range msgs {
+			// todo ???
 			child.interceptors(msg)
+
 		messageSelect:
 			select {
 			case <-child.dying:
+				// broker 挂了
 				child.broker.acks.Done()
 				continue feederLoop
 			case child.messages <- msg:
@@ -611,9 +645,11 @@ feederLoop:
 			}
 		}
 
+		// todo
 		child.broker.acks.Done()
 	}
 
+	// 如果走到这里，说明
 	expiryTicker.Stop()
 	close(child.messages)
 	close(child.errors)
@@ -851,15 +887,20 @@ func (child *partitionConsumer) IsPaused() bool {
 }
 
 type brokerConsumer struct {
-	consumer         *consumer
-	broker           *Broker
-	input            chan *partitionConsumer
+	consumer *consumer
+	broker   *Broker
+	input    chan *partitionConsumer
+	// 该broker 负责拉取的 partition
 	newSubscriptions chan []*partitionConsumer
-	subscriptions    map[*partitionConsumer]none
-	acks             sync.WaitGroup
-	refs             int
+	// broker consumer 负责拉取的partition
+	subscriptions map[*partitionConsumer]none
+	acks          sync.WaitGroup
+	refs          int
 }
 
+/*
+todo
+*/
 func (c *consumer) newBrokerConsumer(broker *Broker) *brokerConsumer {
 	bc := &brokerConsumer{
 		consumer:         c,
@@ -870,7 +911,9 @@ func (c *consumer) newBrokerConsumer(broker *Broker) *brokerConsumer {
 		refs:             0,
 	}
 
+	// 订阅管理器（专门负责整理 partition consumer，放入到 bc.newSubscriptions 中供下面的 bc.subscriptionConsumer 消费）
 	go withRecover(bc.subscriptionManager)
+	// broker 拉取消息并分发给 partition consumer
 	go withRecover(bc.subscriptionConsumer)
 
 	return bc
@@ -880,10 +923,14 @@ func (c *consumer) newBrokerConsumer(broker *Broker) *brokerConsumer {
 // goroutine is in the middle of a network request) and batches it up. The main worker goroutine picks
 // up a batch of new subscriptions between every network request by reading from `newSubscriptions`, so we give
 // it nil if no new subscriptions are available.
+// 这个goroutine 专门用来处理 broker 订阅的 partition consumer
 func (bc *brokerConsumer) subscriptionManager() {
+	// 这个协程（方法）目的在于更新 newSubscriptions
+	// 协程退出的时候，需要关闭这个channel
 	defer close(bc.newSubscriptions)
 
 	for {
+		// 开启一个死循环
 		var partitionConsumers []*partitionConsumer
 
 		// Check for any partition consumer asking to subscribe if there aren't
@@ -892,39 +939,59 @@ func (bc *brokerConsumer) subscriptionManager() {
 		select {
 		case pc, ok := <-bc.input:
 			if !ok {
+				// channel已经close, 该函数return，subscriptionManager 协程结束
 				return
 			}
+			// broker consumer 的 input 是个channel，里面存放的是这个broker 负责消费的 partition consumer
+			// broker订阅到要处理的 parition consumer
 			partitionConsumers = append(partitionConsumers, pc)
 		case bc.newSubscriptions <- nil:
+			// 如果能发送成功，说明之前channel 里的 []pc 已经被消费了。
+			// 然后这里发送一个 nil ，负责消费 newSubscriptions channel的业务收到nil后就表示本轮结束了，broker 可以发起网络请求了
 			continue
 		}
 
+		// 从 bc.input 读到了一个 partition consumer，然后又 重新 for select 了，这样做的目的在于
+		// 当 bc.input 没有消息的时候就直接阻塞了
+		// 而下面这个for 加了个ticker，当 bc.input没有消息的时候会阻塞，但是不会阻塞太久，定时器结束后就退出这个for 循环
+		// 把 收集到的 partition Consumers 放到broker的newSubscriptions channel里，等待后面的 subscriptionConsumer 协程来消费
+
 		// drain input of any further incoming subscriptions
+		// 开启一个定时器
 		timer := time.NewTimer(partitionConsumersBatchTimeout)
 		for batchComplete := false; !batchComplete; {
 			select {
+			// 接着从 bc.input 里接收 partition consumer
 			case pc := <-bc.input:
 				partitionConsumers = append(partitionConsumers, pc)
 			case <-timer.C:
+				// 如果达到了 partitionConsumersBatchTimeout （默认100ms），则认为批量处理完成
 				batchComplete = true
 			}
 		}
 		timer.Stop()
 
+		// 本轮broker 订阅到的 所有 partition consumer
 		Logger.Printf(
 			"consumer/broker/%d accumulated %d new subscriptions\n",
 			bc.broker.ID(), len(partitionConsumers))
 
+		// 把订阅到的 pc 放到 newSubscriptions 这个channel里，后面 subscriptionConsumer 负责消费
+		// broker拉取到消息后，会通过这个channel获取pc，然后把消息放到 p c 的feeder channel里
 		bc.newSubscriptions <- partitionConsumers
 	}
 }
 
 // subscriptionConsumer ensures we will get nil right away if no new subscriptions is available
 // this is the main loop that fetches Kafka messages
+// 负责从broker拉取消息,
 func (bc *brokerConsumer) subscriptionConsumer() {
+	// 这个是上述 subscriptionManager 整理了当前broker 订阅的 pc 后放入到的
+	// 这里之所以弄成一个循环，因为负责拉取的 pc 会变化（todo 什么时候会变化？变化后，不是会触发 rebalace吗？）
 	for newSubscriptions := range bc.newSubscriptions {
 		bc.updateSubscriptions(newSubscriptions)
 
+		// 没有要处理的 topic 订阅，sleep一会，避免for循环浪费cpu
 		if len(bc.subscriptions) == 0 {
 			// We're about to be shut down or we're about to receive more subscriptions.
 			// Take a small nap to avoid burning the CPU.
@@ -932,8 +999,10 @@ func (bc *brokerConsumer) subscriptionConsumer() {
 			continue
 		}
 
+		// 从这个broker上拉取消息（远程调用）
 		response, err := bc.fetchNewMessages()
 		if err != nil {
+			// broker 拉取消息失败后，断开与broker的连接
 			Logger.Printf("consumer/broker/%d disconnecting due to error processing FetchRequest: %s\n", bc.broker.ID(), err)
 			bc.abort(err)
 			return
@@ -941,32 +1010,48 @@ func (bc *brokerConsumer) subscriptionConsumer() {
 
 		// if there isn't response, it means that not fetch was made
 		// so we don't need to handle any response
+		// 如果没有返回数据，下一次再拉取
 		if response == nil {
 			time.Sleep(partitionConsumersBatchTimeout)
 			continue
 		}
 
+		// 后面会依次给每个topic分发消息
 		bc.acks.Add(len(bc.subscriptions))
+		// 分发给从该 broker 拉取消息的 partition consumer
 		for child := range bc.subscriptions {
 			if _, ok := response.Blocks[child.topic]; !ok {
+				// 这个topic处理完成
 				bc.acks.Done()
 				continue
 			}
 
+			// 有当前这个child 对应的topic的消息
+			// 再check是否是这个child 的 partition
 			if _, ok := response.Blocks[child.topic][child.partition]; !ok {
+				// 如果 partition 不匹配，done表示处理完了
 				bc.acks.Done()
 				continue
 			}
 
+			// 有当前这个child（partition consumer）的消息
+			// 把消息放到 partition consumer对应的 feeder channel里，让它自己来消费
+			// 注意这个channel是无缓冲的，当有空间的时候，消息就直接放进channel了。
+			// 但是这里没有 bc.acks.Done() ，而 for 循环外是有一个wait的。
+			// 说明在其他地方会执行 bc.acks.Done()
+			// partitionConsumer 的消费feeder channel里的数据 responseFeeder() 方法里执行的。消费完后，就会执行一个 Done 方法
 			child.feeder <- response
 		}
+		// 消息分发完成。该broker负责的所有topic-partition 都分配完了消息
 		bc.acks.Wait()
+		// 处理 partition consumer 返回的结果
 		bc.handleResponses()
 	}
 }
 
 func (bc *brokerConsumer) updateSubscriptions(newSubscriptions []*partitionConsumer) {
 	for _, child := range newSubscriptions {
+		// broker 负责的 partition consumer
 		bc.subscriptions[child] = none{}
 		Logger.Printf("consumer/broker/%d added subscription to %s/%d\n", bc.broker.ID(), child.topic, child.partition)
 	}
@@ -986,9 +1071,11 @@ func (bc *brokerConsumer) updateSubscriptions(newSubscriptions []*partitionConsu
 // handleResponses handles the response codes left for us by our subscriptions, and abandons ones that have been closed
 func (bc *brokerConsumer) handleResponses() {
 	for child := range bc.subscriptions {
+		// 处理 partition consumer 消费的结果
 		result := child.responseResult
 		child.responseResult = nil
 
+		// 如果成功处理了消息
 		if result == nil {
 			if preferredBroker, _, err := child.preferredBroker(); err == nil {
 				if bc.broker.ID() != preferredBroker.ID() {
@@ -1003,6 +1090,7 @@ func (bc *brokerConsumer) handleResponses() {
 			continue
 		}
 
+		// parition consumer 处理消息失败了
 		// Discard any replica preference.
 		child.preferredReadReplica = invalidPreferredReplicaID
 
@@ -1132,5 +1220,7 @@ func (bc *brokerConsumer) fetchNewMessages() (*FetchResponse, error) {
 		return nil, nil
 	}
 
+	// broker consumer 负责从 broker 拉取消息
+	// 这个bc是整理了 consumer group下所有partition所在的broker的集合
 	return bc.broker.Fetch(request)
 }

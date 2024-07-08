@@ -272,6 +272,7 @@ type FetchResponse struct {
 	// SessionID contains the fetch session ID, or 0 if this is not part of a fetch session.
 	SessionID int32
 	// Blocks contains the response topics.
+	// key 是topic ； value 是map，map的key是 partition，value是这个topic下的这个partition里拉取到的消息
 	Blocks map[string]map[int32]*FetchResponseBlock
 
 	LogAppendTime bool

@@ -97,12 +97,16 @@ type consumerGroup struct {
 }
 
 // NewConsumerGroup creates a new consumer group the given broker addresses and configuration.
+// 线上web服务当前都是用的这种方式，一个服务，多个pod，用一个groupID消费一组 broker 地址
+// consumerGroup 初始化ok后，通过 Consume 来消费指定的topic
 func NewConsumerGroup(addrs []string, groupID string, config *Config) (ConsumerGroup, error) {
+	// 初始化 client，这里主要是开启了一个后台任务来更新metadata（默认10min更新一次）
 	client, err := NewClient(addrs, config)
 	if err != nil {
 		return nil, err
 	}
 
+	// 初始化 consumerGroup
 	c, err := newConsumerGroup(groupID, client)
 	if err != nil {
 		_ = client.Close()
@@ -129,6 +133,7 @@ func newConsumerGroup(groupID string, client Client) (ConsumerGroup, error) {
 		return nil, ConfigurationError("consumer groups require Version to be >= V0_10_2_0")
 	}
 
+	// 只有初始化，里面没有赋值
 	consumer, err := newConsumer(client)
 	if err != nil {
 		return nil, err
@@ -201,11 +206,14 @@ func (c *consumerGroup) Consume(ctx context.Context, topics []string, handler Co
 	}
 
 	// Refresh metadata for requested topics
+	// 这里是启动的时候主动获取了一次 metadata（后面才是利用定时任务来获取）
+	// 指定了消费的topic，获取这些topic关联的 partition 信息
 	if err := c.client.RefreshMetadata(topics...); err != nil {
 		return err
 	}
 
-	// Init session
+	// Init session todo
+	// 最大重试4次
 	sess, err := c.newSession(ctx, topics, handler, c.config.Consumer.Group.Rebalance.Retry.Max)
 	if errors.Is(err, ErrClosedClient) {
 		return ErrClosedConsumerGroup
@@ -214,12 +222,14 @@ func (c *consumerGroup) Consume(ctx context.Context, topics []string, handler Co
 	}
 
 	// Wait for session exit signal or Close() call
+	// 会阻塞在这里，知道 consumerGroup 关闭，或者 session 超时
 	select {
 	case <-c.closed:
 	case <-sess.ctx.Done():
 	}
 
 	// Gracefully release session claims
+	// 消费者退出的时候，释放资源
 	return sess.release(true)
 }
 
@@ -250,6 +260,7 @@ func (c *consumerGroup) retryNewSession(ctx context.Context, topics []string, ha
 	case <-c.closed:
 		return nil, ErrClosedConsumerGroup
 	case <-time.After(c.config.Consumer.Group.Rebalance.Retry.Backoff):
+		// retry 进来后会阻塞，知道满足了retry的 backoff 时间
 	}
 
 	if refreshCoordinator {
@@ -269,12 +280,19 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
+	/*
+		1. 获得 coordinator
+		由于一个kafka 集群中往往有多个broker，这一步是consumerGroup请求获取一个broker 作为 coordinator（协调者）
+		consumerGroup里的第一个消费者请求kafka集群的时候，coordinator 就确定了。
+		coordinator一般选择kafka集群里负载较低的一个broker。
+	*/
 	coordinator, err := c.client.Coordinator(c.groupID)
 	if err != nil {
 		if retries <= 0 {
 			return nil, err
 		}
 
+		//  和 newSession 的区别就是 retryNewSession 会先阻塞一个 retry backoff 的时间，然后再次调用 newSession
 		return c.retryNewSession(ctx, topics, handler, retries, true)
 	}
 
@@ -294,6 +312,14 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 	}
 
 	// Join consumer group
+	/*
+		这一步是所有消费者请求 coordinator 进行 leader的选举。
+		这一步是阻塞的， coordinator 会在所有消费者请求完成后，根据一定策略选取一个消费者作为consumer。
+		同时，coordinator 会将所有成员信息和订阅信息发送给 leader（包括消费者唯一编号 memberID，leaderID等信息）。
+
+		一定要注意 joinGroup 这部是阻塞的，只有broker收到 consumerGroup 里的所有消费者的 joinGroup 请求时，
+		coordinator 才会选择一个leader，给每个消费者分配一个唯一编号memberID，并返回 consumerGroup 里的信息给所有的消费者
+	*/
 	join, err := c.joinGroupRequest(coordinator, topics)
 	if consumerGroupJoinTotal != nil {
 		consumerGroupJoinTotal.Inc(1)
@@ -312,22 +338,31 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 	}
 	switch join.Err {
 	case ErrNoError:
+		// join 返回成功。当前消费者获取到了一个唯一的编号
 		c.memberID = join.MemberId
 	case ErrUnknownMemberId, ErrIllegalGeneration:
 		// reset member ID and retry immediately
 		c.memberID = ""
+		// 不识别的memberID 或者 非法的generation（表明本次返回数据有问题，需要消费者重新发起join操作）
+		// 这类操作可以立马重试，不需要等待
 		return c.newSession(ctx, topics, handler, retries)
 	case ErrNotCoordinatorForConsumer, ErrRebalanceInProgress, ErrOffsetsLoadInProgress:
 		// retry after backoff
 		if retries <= 0 {
 			return nil, join.Err
 		}
+		// 这类错误（比如，正在rebalace中）表明应该要稍后重试（立马重试意义不大，因为正在忙）
 		return c.retryNewSession(ctx, topics, handler, retries, true)
 	case ErrMemberIdRequired:
 		// from JoinGroupRequest v4 onwards (due to KIP-394) if the client starts
 		// with an empty member id, it needs to get the assigned id from the
 		// response and send another join request with that id to actually join the
 		// group
+		/*
+			从 JoinGroupRequest v4 开始（由于 KIP-394），
+			如果客户端以一个空成员 ID 开始，它需要从响应中获取分配的 ID，并用该 ID 发送另一个加入请求，以实际加入该组
+			这里直接调用 newSession 就可以了，因为不需要等待一个backoff的时间
+		*/
 		c.memberID = join.MemberId
 		return c.newSession(ctx, topics, handler, retries)
 	case ErrFencedInstancedId:
@@ -339,9 +374,14 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 		return nil, join.Err
 	}
 
+	/*
+		确定 rebalace 的策略
+	*/
 	var strategy BalanceStrategy
 	var ok bool
 	if strategy = c.config.Consumer.Group.Rebalance.Strategy; strategy == nil {
+		// 老的配置 strategy 的方法，如果业务没有指定的话，就用新的配置在获取一次
+		// 新的方法支持配置多个策略，具体用哪一个，需要根据 joinGroup 之后，coordinator 返回的 GroupProtocol 来匹配
 		strategy, ok = c.findStrategy(join.GroupProtocol, c.config.Consumer.Group.Rebalance.GroupStrategies)
 		if !ok {
 			// this case shouldn't happen in practice, since the leader will choose the protocol
@@ -350,17 +390,27 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 		}
 	}
 
+	/*
+		下一步：leader生成 balance 计划
+		这里leader 会根据初始化时指定的 rebalance 策略生成 balance 计划，
+		嘴周生成的plan 是一个map ： `memberID -> topic -> partitions` ，
+		表示 每个消费者（memberID）对哪个 topic 应该消费哪些 partition
+	*/
+
 	// Prepare distribution plan if we joined as the leader
 	var plan BalanceStrategyPlan
 	var members map[string]ConsumerGroupMemberMetadata
 	var allSubscribedTopicPartitions map[string][]int32
 	var allSubscribedTopics []string
 	if join.LeaderId == join.MemberId {
+		// 是leader
+		// 获取上一步 joinGroup 后，协调者返回的 所有成员的信息
 		members, err = join.GetMembers()
 		if err != nil {
 			return nil, err
 		}
 
+		// 开始生成plan
 		allSubscribedTopicPartitions, allSubscribedTopics, plan, err = c.balance(strategy, members)
 		if err != nil {
 			return nil, err
@@ -368,6 +418,27 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 	}
 
 	// Sync consumer group
+	/*
+		不管是leader还是非leader 都会请求 coordinator，不同的是 leader 的请求信息中会包含完整的 plan,非leader的请求体中plan为空。
+		通过 syncGroup 这个过程，coordinator 将 leader 指定的消费计划 返回给每个消费者
+
+		每个 partition 与 consumer 的分配关系称作一个 "claim"，claim  是一个map：
+		` topic -> partitions` ，表示该消费者对哪个topic应该消费哪些 partition
+
+		消费者在 joinGroup 时已获得自己的memberID，所以根据 memberID 从plan 中取出自己的执行计划即可：
+		topicA要消费partitionX，topicB要消费 partionY。
+		这样后续就到了 consumer 阶段。
+
+		注意：这里只有broker收到来自leader的syncGroup后才会对消费者进行响应。
+	*/
+
+	/*
+		coordinator： 第一阶段获取到的协调者（brokerID）
+		members：joinGroup步骤中，coordinator 返回的信息（是为了回传吗？）
+		plan： 第三阶段生成的计划，如果不是leader，plan就为空
+		generation：joinGroup阶段，coordinator 返回的第几代
+		strategy：最终采用的 rebalace 策略
+	*/
 	syncGroupResponse, err := c.syncGroupRequest(coordinator, members, plan, join.GenerationId, strategy)
 	if consumerGroupSyncTotal != nil {
 		consumerGroupSyncTotal.Inc(1)
@@ -385,6 +456,7 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 		}
 	}
 
+	// syncGroup 错误处理
 	switch syncGroupResponse.Err {
 	case ErrNoError:
 	case ErrUnknownMemberId, ErrIllegalGeneration:
@@ -407,6 +479,7 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 	}
 
 	// Retrieve and sort claims
+	// 获得分配的claim，并排序
 	var claims map[string][]int32
 	if len(syncGroupResponse.MemberAssignment) > 0 {
 		members, err := syncGroupResponse.GetMemberAssignment()
@@ -429,6 +502,9 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 		}
 	}
 
+	/*
+
+	 */
 	session, err := newConsumerGroupSession(ctx, c, claims, join.MemberId, join.GenerationId, handler)
 	if err != nil {
 		return nil, err
@@ -436,6 +512,7 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 
 	// only the leader needs to check whether there are newly-added partitions in order to trigger a rebalance
 	if join.LeaderId == join.MemberId {
+		// 如果是leader，需要开启一个后台协程，用于检测是 partition 是否有变化
 		go c.loopCheckPartitionNumbers(allSubscribedTopicPartitions, allSubscribedTopics, session)
 	}
 
@@ -444,8 +521,12 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 
 func (c *consumerGroup) joinGroupRequest(coordinator *Broker, topics []string) (*JoinGroupResponse, error) {
 	req := &JoinGroupRequest{
-		GroupId:        c.groupID,
-		MemberId:       c.memberID,
+		// 消费者组
+		GroupId: c.groupID,
+		// 第一次请求的时候，还没有 memberID。joinGroup 主要是发送 groupID 和 topic信息
+		MemberId: c.memberID,
+		// 默认是10s
+		// coordinator 在 SessionTimeout 之后，如果没有收到 consumer 发送的心跳，就认为 consumer 挂了
 		SessionTimeout: int32(c.config.Consumer.Group.Session.Timeout / time.Millisecond),
 		ProtocolType:   "consumer",
 	}
@@ -479,6 +560,7 @@ func (c *consumerGroup) joinGroupRequest(coordinator *Broker, topics []string) (
 		UserData: c.userData,
 	}
 	var strategy BalanceStrategy
+	// todo 为什么要把 rebalace 的策略发送给broker？ 不是client负责生成rebalace计划么，broker要这个字段是为了干啥？
 	if strategy = c.config.Consumer.Group.Rebalance.Strategy; strategy != nil {
 		if err := req.AddGroupProtocolMetadata(strategy.Name(), meta); err != nil {
 			return nil, err
@@ -491,6 +573,8 @@ func (c *consumerGroup) joinGroupRequest(coordinator *Broker, topics []string) (
 		}
 	}
 
+	// 发起请求
+	// 返回的几个关键信息：generation、memberID、leaderID、groupMembers
 	return coordinator.JoinGroup(req)
 }
 
@@ -584,6 +668,7 @@ func (c *consumerGroup) balance(strategy BalanceStrategy, members map[string]Con
 		}
 	}
 
+	// 该 consumerGroup下的所有 memberID 所订阅的 topic 的合集
 	allSubscribedTopics := make([]string, 0, len(topicPartitions))
 	for topic := range topicPartitions {
 		allSubscribedTopics = append(allSubscribedTopics, topic)
@@ -591,12 +676,15 @@ func (c *consumerGroup) balance(strategy BalanceStrategy, members map[string]Con
 
 	// refresh metadata for all the subscribed topics in the consumer group
 	// to avoid using stale metadata to assigning partitions
+	// 注意，这里主动重新刷新了一次 metadata 信息（强制发起了一次远程调用来更新内存里的metadata信息）
 	err := c.client.RefreshMetadata(allSubscribedTopics...)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
+	// 获取topic下的partition信息
 	for topic := range topicPartitions {
+		// 获取该topic下的详细的 partition （直接读的内存，因为上面已经强制刷新过一次了 RefreshMetadata）
 		partitions, err := c.client.Partitions(topic)
 		if err != nil {
 			return nil, nil, nil, err
@@ -604,6 +692,7 @@ func (c *consumerGroup) balance(strategy BalanceStrategy, members map[string]Con
 		topicPartitions[topic] = partitions
 	}
 
+	// 根据具体的策略，生成计划
 	plan, err := strategy.Plan(members, topicPartitions)
 	return topicPartitions, allSubscribedTopics, plan, err
 }
@@ -821,6 +910,9 @@ func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims 
 	}
 
 	// init session
+	/*
+		session 可以理解成 一个 consumer （consumerGroup 里的一个 consumer）
+	*/
 	sess := &consumerGroupSession{
 		parent:       parent,
 		memberID:     memberID,
@@ -835,11 +927,19 @@ func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims 
 	}
 
 	// start heartbeat loop
+	/*
+		当前消费者如果在指定时间内没有向服务端发送心跳则被认为死亡，将触发协调器发出分区再平衡，
+		此参数可以适当设置大一些，以免由于网络抖动或者垃圾收集造成触发分区再平衡，不过如果设置太大，也会造成监测到故障节点不及时
+
+		一个 consumerGroup 开启一个 heartbeat 用于处理
+	*/
 	go sess.heartbeatLoop()
 
-	// create a POM for each claim
+	// create a POM for each claim （POM： PartitionOffsetManager ）
 	for topic, partitions := range claims {
 		for _, partition := range partitions {
+			// 给每个topic下的，分配到的每个 partition 生成一个 partition offset manager
+			// 并赋值到了 offset的 poms （topic -> partition -> offset）
 			pom, err := offsets.ManagePartition(topic, partition)
 			if err != nil {
 				_ = sess.release(false)
@@ -849,6 +949,7 @@ func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims 
 			// handle POM errors
 			go func(topic string, partition int32) {
 				for err := range pom.Errors() {
+					// 单独开了一个协程，从 pom 里读取错误，并处理 todo 使用场景是啥？
 					sess.parent.handleError(err, topic, partition)
 				}
 			}(topic, partition)
@@ -856,6 +957,7 @@ func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims 
 	}
 
 	// perform setup
+	// 消费者的 setup 。一般消费者都会重写该方法。用于通知新的session要开始了
 	if err := handler.Setup(sess); err != nil {
 		_ = sess.release(true)
 		return nil, err
@@ -866,6 +968,9 @@ func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims 
 		for _, partition := range partitions {
 			sess.waitGroup.Add(1)
 
+			// 这里，也就是说这个consumer 被分配到多少个 partition 就会开启多少个协程
+			// 这个协程会阻塞在 consume 方法上，用于持续的从 partition 拉取消息并消费
+			// 这里就是核心的消费方法了
 			go func(topic string, partition int32) {
 				defer sess.waitGroup.Done()
 
@@ -874,10 +979,13 @@ func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims 
 				defer sess.cancel()
 
 				// consume a single topic/partition, blocking
+				// 开了一个协程用来消费。consume 这个方法是阻塞的（所以才开了一个协程来消费）
 				sess.consume(topic, partition)
 			}(topic, partition)
 		}
 	}
+
+	// 返回了 session
 	return sess, nil
 }
 
@@ -912,16 +1020,22 @@ func (s *consumerGroupSession) Context() context.Context {
 func (s *consumerGroupSession) consume(topic string, partition int32) {
 	// quick exit if rebalance is due
 	select {
+	// 初始化 consumerGroupSession 的时候传进去的 cancel context，在多个地方都有接收。
+	// 在多个地方都有调用 cancel，然后 partition 的消费协程就可以退出了
 	case <-s.ctx.Done():
 		return
 	case <-s.parent.closed:
+		// consumerGroup如果被关闭，这里也会退出。
 		return
 	default:
 	}
 
 	// get next offset
+	// 从哪里开始消费。配置中指定的：最新还是最旧
 	offset := s.parent.config.Consumer.Offsets.Initial
+	// 取出来了 pom （因为对象是 session)
 	if pom := s.offsets.findPOM(topic, partition); pom != nil {
+		// 前面已经做过offset的计算了，如果能拿到就返回。否则就返回业务指定的 newest 或 oldest
 		offset, _ = pom.NextOffset()
 	}
 
@@ -965,6 +1079,9 @@ func (s *consumerGroupSession) release(withCleanup bool) (err error) {
 	s.cancel()
 
 	// wait for consumers to exit
+	// 这个ADD 是在开协程给每个partition 消费的时候
+	// Done 是在每个消费协程退出的时候
+	// 也就是说，这个 release 会等待每个消费协程的退出
 	s.waitGroup.Wait()
 
 	// perform release
@@ -1118,6 +1235,7 @@ type consumerGroupClaim struct {
 }
 
 func newConsumerGroupClaim(sess *consumerGroupSession, topic string, partition int32, offset int64) (*consumerGroupClaim, error) {
+	// 当前这个session 归属的 consumerGroup 下的 consumer ，来生成一个 pcm （那这个也是每个 partition 消费线程一个pcm了）
 	pcm, err := sess.parent.consumer.ConsumePartition(topic, partition, offset)
 
 	if errors.Is(err, ErrOffsetOutOfRange) && sess.parent.config.Consumer.Group.ResetInvalidOffsets {

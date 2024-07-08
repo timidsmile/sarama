@@ -200,6 +200,8 @@ func (b *Broker) Open(conf *Config) error {
 				}
 			}
 		}()
+
+		// tcp 的方式连接到 coordinator broker
 		dialer := conf.getDialer()
 		b.conn, b.connErr = dialer.Dial("tcp", b.addr)
 		if b.connErr != nil {
@@ -256,6 +258,7 @@ func (b *Broker) Open(conf *Config) error {
 		b.done = make(chan bool)
 		b.responses = make(chan *responsePromise, b.conf.Net.MaxOpenRequests-1)
 
+		// 异步接受的返回的结果
 		go withRecover(b.responseReceiver)
 		if conf.Net.SASL.Enable && !useSaslV0 {
 			b.connErr = b.authenticateViaSASLv1()

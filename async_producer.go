@@ -75,7 +75,9 @@ type asyncProducer struct {
 	client Client
 	conf   *Config
 
-	errors                    chan *ProducerError
+	errors chan *ProducerError
+	// input 用来接收消息，其中同步发送的是消息扔进 input 后，等待返回后再给上游业务返回结果
+	// input 是无缓冲channel
 	input, successes, retries chan *ProducerMessage
 	inFlight                  sync.WaitGroup
 
@@ -132,7 +134,10 @@ func newAsyncProducer(client Client) (AsyncProducer, error) {
 	}
 
 	// launch our singleton dispatchers
+	// 处理用户发送的消息，把消息先分发给 topic producer
+	Logger.Println("producer/leader/%s/%d state change to [retrying-%d]\n")
 	go withRecover(p.dispatcher)
+	//
 	go withRecover(p.retryHandler)
 
 	return p, nil
@@ -390,6 +395,7 @@ func (p *asyncProducer) dispatcher() {
 	handlers := make(map[string]chan<- *ProducerMessage)
 	shuttingDown := false
 
+	// 处理用户发送的消息(用户的消息最先到达的是 producer 的 input channel），然后再分发给 topic producer
 	for msg := range p.input {
 		if msg == nil {
 			Logger.Println("Something tried to send a nil message, it was ignored.")
@@ -456,15 +462,20 @@ func (p *asyncProducer) dispatcher() {
 			continue
 		}
 
+		// 处理该topic 的handler
 		handler := handlers[msg.Topic]
 		if handler == nil {
+			// 第一次处理，需要给该 topic 生成 topic producer
+			// 这里面又开了一个协程，专门负责处理这个topic的msg（也是一个dispatch 的过程）
 			handler = p.newTopicProducer(msg.Topic)
 			handlers[msg.Topic] = handler
 		}
 
+		// 把msg丢给 handler 去处理（相当于分发到了topic）
 		handler <- msg
 	}
 
+	// 走的到这里说明producer被关闭了，所以 producer 也要负责关闭 topic handler
 	for _, handler := range handlers {
 		close(handler)
 	}
@@ -475,7 +486,8 @@ func (p *asyncProducer) dispatcher() {
 type topicProducer struct {
 	parent *asyncProducer
 	topic  string
-	input  <-chan *ProducerMessage
+	// 用于接收msg
+	input <-chan *ProducerMessage
 
 	breaker     *breaker.Breaker
 	handlers    map[int32]chan<- *ProducerMessage
@@ -485,20 +497,24 @@ type topicProducer struct {
 func (p *asyncProducer) newTopicProducer(topic string) chan<- *ProducerMessage {
 	input := make(chan *ProducerMessage, p.conf.ChannelBufferSize)
 	tp := &topicProducer{
-		parent:      p,
-		topic:       topic,
-		input:       input,
+		parent: p,
+		topic:  topic,
+		input:  input,
+		// 注意这里有个限速器！！！
 		breaker:     breaker.New(3, 1, 10*time.Second),
 		handlers:    make(map[int32]chan<- *ProducerMessage),
 		partitioner: p.conf.Producer.Partitioner(topic),
 	}
+	// msg -> topic producer -> partition producer
 	go withRecover(tp.dispatch)
 	return input
 }
 
 func (tp *topicProducer) dispatch() {
+	// 从 topic input 里读取消息（这个消息是 producer dispatch 过来的）
 	for msg := range tp.input {
 		if msg.retries == 0 {
+			// todo
 			if err := tp.partitionMessage(msg); err != nil {
 				tp.parent.returnError(msg, err)
 				continue
@@ -507,13 +523,16 @@ func (tp *topicProducer) dispatch() {
 
 		handler := tp.handlers[msg.Partition]
 		if handler == nil {
+			// partition producer
 			handler = tp.parent.newPartitionProducer(msg.Topic, msg.Partition)
 			tp.handlers[msg.Partition] = handler
 		}
 
+		// 把消息传给 partition producer 的input
 		handler <- msg
 	}
 
+	// 同样topic producer 要负责关闭 partition producer（关闭channel 即可）
 	for _, handler := range tp.handlers {
 		close(handler)
 	}
@@ -569,8 +588,9 @@ type partitionProducer struct {
 	partition int32
 	input     <-chan *ProducerMessage
 
-	leader         *Broker
-	breaker        *breaker.Breaker
+	leader  *Broker
+	breaker *breaker.Breaker
+	// 当前partition 分到的 broker
 	brokerProducer *brokerProducer
 
 	// highWatermark tracks the "current" retry level, which is the only one where we actually let messages through,
@@ -594,9 +614,11 @@ func (p *asyncProducer) newPartitionProducer(topic string, partition int32) chan
 		partition: partition,
 		input:     input,
 
+		// 又有一个限速器？？？
 		breaker:    breaker.New(3, 1, 10*time.Second),
 		retryState: make([]partitionRetryState, p.conf.Producer.Retry.Max+1),
 	}
+	// producer -> topic producer -> partition producer -> broker producer
 	go withRecover(pp.dispatch)
 	return input
 }
@@ -616,6 +638,7 @@ func (pp *partitionProducer) backoff(retries int) {
 
 func (pp *partitionProducer) updateLeaderIfBrokerProducerIsNil(msg *ProducerMessage) error {
 	if pp.brokerProducer == nil {
+		// 更新了 metadata，并重新获取leader，如果leader不存在就重新初始化
 		if err := pp.updateLeader(); err != nil {
 			pp.parent.returnError(msg, err)
 			pp.backoff(msg.retries)
@@ -629,12 +652,17 @@ func (pp *partitionProducer) updateLeaderIfBrokerProducerIsNil(msg *ProducerMess
 func (pp *partitionProducer) dispatch() {
 	// try to prefetch the leader; if this doesn't work, we'll do a proper call to `updateLeader`
 	// on the first message
+	// 获取topic下的编号为 partition 所在的broker
+	// 这个leader 可以理解成负责这个topic 下的这个 partition 的一个主broker
 	pp.leader, _ = pp.parent.client.Leader(pp.topic, pp.partition)
 	if pp.leader != nil {
+		// 找到broker后，就初始化broker，并把broker赋值给 partition producer
+		// 初始化好的broker 底层会开启很多个协程，其中一个是 RUN，负责从broker的input里读取msg 并发送
 		pp.brokerProducer = pp.parent.getBrokerProducer(pp.leader)
 		pp.parent.inFlight.Add(1) // we're generating a syn message; track it so we don't shut down while it's still inflight
 		pp.brokerProducer.input <- &ProducerMessage{Topic: pp.topic, Partition: pp.partition, flags: syn}
 	}
+	// 如果没有找到对应的broker
 
 	defer func() {
 		if pp.brokerProducer != nil {
@@ -642,21 +670,30 @@ func (pp *partitionProducer) dispatch() {
 		}
 	}()
 
+	// 这个是topic producer 写入到input里的
 	for msg := range pp.input {
+		// 如果当前这个broker
 		if pp.brokerProducer != nil && pp.brokerProducer.abandoned != nil {
+			// partition producer 找到了对应的broker producer
 			select {
 			case <-pp.brokerProducer.abandoned:
 				// a message on the abandoned channel means that our current broker selection is out of date
 				Logger.Printf("producer/leader/%s/%d abandoning broker %d\n", pp.topic, pp.partition, pp.leader.ID())
+				// abandon channel 上收到了消息，表明我们当前的broker已过期了，需要重新选择broker
+				// 首先删除producer 维护的这个 broker
 				pp.parent.unrefBrokerProducer(pp.leader, pp.brokerProducer)
+				// 把当前partition producer 分到的broker置为空
 				pp.brokerProducer = nil
+				// 等待一个 backoff 时间 todo 下次重试的时间 为什么要等待呢？这种重试不能立马重试吗？
 				time.Sleep(pp.parent.conf.Producer.Retry.Backoff)
 			default:
 				// producer connection is still open.
 			}
 		}
 
+		// 重试次数大于水位线了，说明该消息的优先级比较高
 		if msg.retries > pp.highWatermark {
+			//
 			if err := pp.updateLeaderIfBrokerProducerIsNil(msg); err != nil {
 				continue
 			}
@@ -664,6 +701,7 @@ func (pp *partitionProducer) dispatch() {
 			pp.newHighWatermark(msg.retries)
 			pp.backoff(msg.retries)
 		} else if pp.highWatermark > 0 {
+			// 说明在retry中 todo
 			// we are retrying something (else highWatermark would be 0) but this message is not a *new* retry level
 			if msg.retries < pp.highWatermark {
 				// in fact this message is not even the current retry level, so buffer it for now (unless it's a just a fin)
@@ -752,6 +790,7 @@ func (pp *partitionProducer) flushRetryBuffers() {
 	}
 }
 
+// 重新获取 metadata，并重新选取leader，然后重新初始化 broker producer
 func (pp *partitionProducer) updateLeader() error {
 	return pp.breaker.Run(func() (err error) {
 		if err = pp.parent.client.RefreshMetadata(pp.topic); err != nil {
@@ -762,6 +801,7 @@ func (pp *partitionProducer) updateLeader() error {
 			return err
 		}
 
+		// 初始化 leader broker。首先会从producer里获取这个broker，如果没有的话，就重新初始化这个broker
 		pp.brokerProducer = pp.parent.getBrokerProducer(pp.leader)
 		pp.parent.inFlight.Add(1) // we're generating a syn message; track it so we don't shut down while it's still inflight
 		pp.brokerProducer.input <- &ProducerMessage{Topic: pp.topic, Partition: pp.partition, flags: syn}
@@ -788,6 +828,7 @@ func (p *asyncProducer) newBrokerProducer(broker *Broker) *brokerProducer {
 		buffer:         newProduceSet(p),
 		currentRetries: make(map[string]map[int32]error),
 	}
+	// run 负责消费 partition producer里生产的消息
 	go withRecover(bp.run)
 
 	// minimal bridge to make the network response `select`able
@@ -915,6 +956,7 @@ func (bp *brokerProducer) run() {
 
 	for {
 		select {
+		// 最后一个从 input 里消费消息了
 		case msg, ok := <-bp.input:
 			if !ok {
 				Logger.Printf("producer/broker/%d input chan closed\n", bp.broker.ID())
@@ -974,11 +1016,13 @@ func (bp *brokerProducer) run() {
 					continue
 				}
 			}
+			// 消息写入xxx
 			if err := bp.buffer.add(msg); err != nil {
 				bp.parent.returnError(msg, err)
 				continue
 			}
 
+			//
 			if bp.parent.conf.Producer.Flush.Frequency > 0 && bp.timer == nil {
 				bp.timer = time.NewTimer(bp.parent.conf.Producer.Flush.Frequency)
 				timerChan = bp.timer.C
@@ -1177,6 +1221,7 @@ func (p *asyncProducer) retryBatch(topic string, partition int32, pSet *partitio
 		}
 		return
 	}
+	// 初始化 broker producer
 	bp := p.getBrokerProducer(leader)
 	bp.output <- produceSet
 	p.unrefBrokerProducer(leader, bp)
@@ -1339,7 +1384,9 @@ func (p *asyncProducer) getBrokerProducer(broker *Broker) *brokerProducer {
 
 	bp := p.brokers[broker]
 
+	// producer 没有维护这个broker信息的话，就重新初始化
 	if bp == nil {
+		// 初始化 broker producer
 		bp = p.newBrokerProducer(broker)
 		p.brokers[broker] = bp
 		p.brokerRefs[bp] = 0

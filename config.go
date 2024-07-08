@@ -184,6 +184,9 @@ type Config struct {
 		// RequiredAcks is set to WaitForAll or a number > 1. Only supports
 		// millisecond resolution, nanoseconds will be truncated. Equivalent to
 		// the JVM producer's `request.timeout.ms` setting.
+		/*
+			该配置可控制客户端等待请求响应的最长时间。如果在超时前未收到响应，客户端将在必要时重新发送请求，或者在重试次数用尽后请求失败。
+		*/
 		Timeout time.Duration
 		// The type of compression to use on messages (defaults to no compression).
 		// Similar to `compression.codec` setting of the JVM producer.
@@ -407,6 +410,16 @@ type Config struct {
 		// be between `MaxProcessingTime` and `2 * MaxProcessingTime`. For
 		// example, if `MaxProcessingTime` is 100ms then a delay of 180ms
 		// between two messages being sent may not be recognized as a timeout.
+
+		/*
+			消费者期望用户处理消息的最长时间。
+			如果写入 Messages channel 所需的时间超过了这一时间，该分区将停止获取更多的消息，直到可以继续处理为止。
+			注意，由于  Messages channel 是缓冲通道，实际宽限时间为 (MaxProcessingTime * ChannelBufferSize)。默认值为 100 毫秒。
+			如果在 expiryTicker 的两个滴答时间内没有向 Messages channel 写入消息，就会检测到超时。
+			使用ticker而不是 timer 来检测超时，通常会减少对timer函数的调用，如果发送的消息较多，而超时又不频繁，则性能会有显著提高。
+			使用ticker而不是timer的缺点是超时的准确性较低。也就是说，有效超时可能介于 `MaxProcessingTime` 和 `2 * MaxProcessingTime` 之间。
+			例如，如果 `MaxProcessingTime` 为 100 毫秒，那么 180 毫秒的延迟 可能不会被视为超时。
+		*/
 		MaxProcessingTime time.Duration
 
 		// Return specifies what channels will be populated. If they are set to true,
@@ -466,6 +479,10 @@ type Config struct {
 		// *ConsumerMessage modified by the first interceptor's OnConsume() is
 		// passed to the second interceptor OnConsume(), and so on in the
 		// interceptor chain.
+		/*
+			在记录发送到信息通道之前调用拦截器。拦截器允许拦截信息，并可能在信息返回客户端之前对其进行修改。
+			第一个拦截器 OnConsume() 所修改的 *ConsumerMessage 会传递给第二个拦截器 OnConsume()，在拦截器链中依此类推。
+		*/
 		Interceptors []ConsumerInterceptor
 	}
 

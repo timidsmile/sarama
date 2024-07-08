@@ -77,7 +77,10 @@ func newOffsetManagerFromClient(group, memberID string, generation int32, client
 		om.groupInstanceId = &conf.Consumer.Group.InstanceId
 	}
 	if conf.Consumer.Offsets.AutoCommit.Enable {
+		// 自动提交。如果开启了自动提交，也并不是每次消费后立马发起一次网络调用来提交这个offset
+		// 如果开启了自动提交，那么在初始化 offsetManager 的时候会启动一个定时器，默认每隔 1s 提交offset到broker。
 		om.ticker = time.NewTicker(conf.Consumer.Offsets.AutoCommit.Interval)
+		// todo
 		go withRecover(om.mainLoop)
 	}
 
@@ -85,6 +88,7 @@ func newOffsetManagerFromClient(group, memberID string, generation int32, client
 }
 
 func (om *offsetManager) ManagePartition(topic string, partition int32) (PartitionOffsetManager, error) {
+	// 依次查询每个topic下的每个partition 的offset，获取一个 partition offset manager
 	pom, err := om.newPartitionOffsetManager(topic, partition)
 	if err != nil {
 		return nil, err
@@ -93,6 +97,7 @@ func (om *offsetManager) ManagePartition(topic string, partition int32) (Partiti
 	om.pomsLock.Lock()
 	defer om.pomsLock.Unlock()
 
+	// 取出每个topic的 pom -> topic manager
 	topicManagers := om.poms[topic]
 	if topicManagers == nil {
 		topicManagers = make(map[int32]*partitionOffsetManager)
@@ -145,25 +150,33 @@ func (om *offsetManager) computeBackoff(retries int) time.Duration {
 }
 
 func (om *offsetManager) fetchInitialOffset(topic string, partition int32, retries int) (int64, int32, string, error) {
+	// todo 这里强制重新获取了一次 coordinator 而不是利用第一步返回的 原因是什么
 	broker, err := om.coordinator()
 	if err != nil {
 		if retries <= 0 {
+			// 没有重试次数了，直接返回错误
 			return 0, 0, "", err
 		}
+		// 否则调用自身方法重试
 		return om.fetchInitialOffset(topic, partition, retries-1)
 	}
 
+	// 成功获取到了 coordinator
 	partitions := map[string][]int32{topic: {partition}}
+	// 组装请求体
 	req := NewOffsetFetchRequest(om.conf.Version, om.group, partitions)
+	// 向 coordinator 发起请求，获取每个partition 的 offset
 	resp, err := broker.FetchOffset(req)
 	if err != nil {
 		if retries <= 0 {
 			return 0, 0, "", err
 		}
+		// 如果获取错误，需要重新获取 coordinator ，重新执行本方法再查询一次
 		om.releaseCoordinator(broker)
 		return om.fetchInitialOffset(topic, partition, retries-1)
 	}
 
+	// 成功拿到了返回值
 	block := resp.GetBlock(topic, partition)
 	if block == nil {
 		return 0, 0, "", ErrIncompleteResponse
@@ -195,6 +208,7 @@ func (om *offsetManager) fetchInitialOffset(topic string, partition int32, retri
 }
 
 func (om *offsetManager) coordinator() (*Broker, error) {
+	// om.broker 第一次的时候是nil，赋值就在本函数的下面
 	om.brokerLock.RLock()
 	broker := om.broker
 	om.brokerLock.RUnlock()
@@ -210,10 +224,14 @@ func (om *offsetManager) coordinator() (*Broker, error) {
 		return broker, nil
 	}
 
+	/*
+		todo 为什么都已经完成cliam分配了，又在这里发起了一次获取 coordinator 的过程呢？
+	*/
 	if err := om.client.RefreshCoordinator(om.group); err != nil {
 		return nil, err
 	}
 
+	// 返回该 group 的 coordinator （因为上面已经refresh 一次了，因此这里是从内存里直接拿的）
 	broker, err := om.client.Coordinator(om.group)
 	if err != nil {
 		return nil, err
@@ -231,6 +249,11 @@ func (om *offsetManager) releaseCoordinator(b *Broker) {
 	om.brokerLock.Unlock()
 }
 
+/*
+offsetManager 定时任务。
+当开启 自动提交后，会在后台每隔一定时间批量提交 offset
+一个 consumerGroup 只有一个 offsetManager，所以相当于一个 consumerGroup 只有一个协程用于提交 offset
+*/
 func (om *offsetManager) mainLoop() {
 	defer om.ticker.Stop()
 	defer close(om.closed)

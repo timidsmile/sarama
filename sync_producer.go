@@ -57,6 +57,7 @@ type syncProducer struct {
 	wg       sync.WaitGroup
 }
 
+// todo 我们默认使用的是同步生产者模式
 // NewSyncProducer creates a new SyncProducer using the given broker addresses and configuration.
 func NewSyncProducer(addrs []string, config *Config) (SyncProducer, error) {
 	if config == nil {
@@ -68,10 +69,13 @@ func NewSyncProducer(addrs []string, config *Config) (SyncProducer, error) {
 		return nil, err
 	}
 
+	// 这里，里面开了两个协程： dispatcher 和 retryHandler
 	p, err := NewAsyncProducer(addrs, config)
 	if err != nil {
 		return nil, err
 	}
+
+	// 下面这个方法开了两个协程，分别从 success 和 error channel里读数据
 	return newSyncProducerFromAsyncProducer(p.(*asyncProducer)), nil
 }
 
@@ -92,7 +96,10 @@ func NewSyncProducerFromClient(client Client) (SyncProducer, error) {
 func newSyncProducerFromAsyncProducer(p *asyncProducer) *syncProducer {
 	sp := &syncProducer{producer: p}
 
+	// 因为同步还是使用的异步的生产者，底层自己用waitGroup实现的同步效果
 	sp.wg.Add(2)
+	// 下面两个协程收到结果后，就会执行 Done
+	// 最终wait是在关闭生产者的时候（等待发送成功，才能关闭生产者）
 	go withRecover(sp.handleSuccesses)
 	go withRecover(sp.handleErrors)
 
@@ -112,6 +119,10 @@ func verifyProducerConfig(config *Config) error {
 func (sp *syncProducer) SendMessage(msg *ProducerMessage) (partition int32, offset int64, err error) {
 	expectation := make(chan *ProducerError, 1)
 	msg.expectation = expectation
+
+	Logger.Println("SendMessage。。。。。\n")
+
+	// 同步发送也是直接把消息扔到了 input 这个channel 里，后续会阻塞在结果 expectation 这个channel 上
 	sp.producer.Input() <- msg
 
 	if pErr := <-expectation; pErr != nil {
@@ -148,6 +159,7 @@ func (sp *syncProducer) SendMessages(msgs []*ProducerMessage) error {
 
 func (sp *syncProducer) handleSuccesses() {
 	defer sp.wg.Done()
+	// 同步生产者封装好了接收结果的方法
 	for msg := range sp.producer.Successes() {
 		expectation := msg.expectation
 		expectation <- nil
